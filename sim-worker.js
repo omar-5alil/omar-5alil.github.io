@@ -28,11 +28,12 @@ self.addEventListener('message', (ev) => {
     vs: out.vs,
     wzs: out.wzs,
     times: out.times,
+    ms: out.ms,
     crater_km: out.crater_km,
     mw: out.mw,
     tsunami_m: out.tsunami_m,
     meta: out.meta
-  }, [out.xs, out.lats, out.lons, out.alts, out.vs, out.wzs, out.times]);
+  }, [out.xs, out.lats, out.lons, out.alts, out.vs, out.wzs, out.times, out.ms]);
 });
 
 function toRad(d) { return d * Math.PI / 180; }
@@ -69,12 +70,47 @@ function derivsVec(state, p) {
   const v = Math.sqrt(vx*vx + wz*wz) || 1e-6;
   const A = Math.PI * (p.radius * p.radius);
   const rho = rhoAtmosphere(Math.max(0, state.z));
+
+  // Drag (unchanged)
   let Cd = p.Cd;
   if (v > 15000) Cd = 0.3; else if (v > 8000) Cd = 0.5; else Cd = 1.0;
-  const dragFactor = 0.5 * Cd * rho * A * v * v / m;
+  const dragFactor = 0.5 * Cd * rho * A * v * v / Math.max(1e-9, m);
   const ax = -dragFactor * (vx / v);
   const az = -dragFactor * (wz / v) - p.g;
-  const dmdt = - (p.Ch * rho * A * v * v) / (2 * p.Q); // ablation model ~ v^2
+
+  // --- Moderated ablation model ---
+  // Original: dmdt_raw = -(p.Ch * rho * A * v^2) / (2 * p.Q)
+  // We apply multipliers so near-ground mass loss is less abrupt.
+  const HEAT = {
+    vCut: 4000,      // below this speed ablation efficiency ~0
+    vRef: 12000,     // above this speed velocity factor ~1
+    altShield: 10000, // m, altitude scale controlling near-ground taper
+    dynP0: 2e5,      // Pa, soft reference for dynamic pressure ramp
+    maxRho: 0.5      // kg/m^3 cap for ablation heating (dense boundary layer mitigation)
+  };
+
+  const clamp01 = (x) => x < 0 ? 0 : (x > 1 ? 1 : x);
+
+  // Effective density (prevents explosive growth at very low altitude)
+  const rhoEff = Math.min(rho, HEAT.maxRho);
+
+  // Velocity efficiency (smooth 0→1)
+  let effV = (v - HEAT.vCut) / (HEAT.vRef - HEAT.vCut);
+  effV = Math.pow(clamp01(effV), 1.3); // slight bias toward higher speeds
+
+  // Altitude shielding (→0 at ground, ~1 high up)
+  const zPos = Math.max(0, state.z);
+  const effAlt = zPos / (zPos + HEAT.altShield); // simple rational taper
+
+  // Dynamic pressure ramp
+  const dynP = 0.5 * rhoEff * v * v;
+  const effDynP = dynP / (dynP + HEAT.dynP0);
+
+  const heatMult = effV * effAlt * effDynP;
+
+  const dmdt_base = - (p.Ch * rhoEff * A * v * v) / (2 * p.Q);
+  const dmdt = dmdt_base * heatMult;
+
   return { dxdt: vx, dzdt: wz, ax, az, dmdt, speed: v };
 }
 
@@ -131,7 +167,9 @@ function runSimulation(pIn) {
   // Physical parameters
   const radius = diameter / 2;
   const mass0 = (4/3) * Math.PI * Math.pow(radius, 3) * density;
-  const params = { radius, Cd: 1.0, Ch: 0.01, Q: 2e7, g: 9.81 };
+  // Adjusted ablation parameters: lower heating efficiency (Ch) and higher heat of ablation (Q)
+  // to prevent unrealistically rapid mass loss.
+  const params = { radius, Cd: 1.0, Ch: 0.005, Q: 5e7, g: 9.81 };
   const strength = 10e6; // fragmentation threshold reference
 
   // Initial state
@@ -144,19 +182,32 @@ function runSimulation(pIn) {
   let t = 0;
 
   // Dynamic storage
-  const xs = [], lats = [], lons = [], alts = [], vs = [], wzs = [], times = [];
+  const xs = [], lats = [], lons = [], alts = [], vs = [], wzs = [], times = [], ms = [];
   const HARD_STEP_LIMIT = 2_000_000; // safeguard ~2M samples
   const REPORT_INTERVAL = 5000;
   const z_adapt_threshold = 10000;
   let steps = 0; let impacted = false; let impactTime = null;
 
+  let disintegrated = false;
+  let disintegrationIndex = -1;
+  let disintegrationTime = null;
+  const MIN_FRACTION_FOR_CONTINUATION = 0.0001; // 0.01% of original mass
   while (steps < HARD_STEP_LIMIT) {
     if (z <= 0) { impacted = true; break; }
-    if (m < 0.001 * mass0) m = 0.001 * mass0; // prevent full ablation removal
 
     const [plat, plon] = destinationLatLon(lat0, lon0, bearing, x);
     xs.push(x); lats.push(plat); lons.push(plon); alts.push(Math.max(0,z));
-    const speedCurr = Math.sqrt(vx*vx + wz*wz); vs.push(speedCurr); wzs.push(wz); times.push(t);
+    const speedCurr = Math.sqrt(vx*vx + wz*wz); vs.push(speedCurr); wzs.push(wz); times.push(t); ms.push(m);
+
+    // After recording this sample, check disintegration (so UI can at least display this frame).
+    if (!disintegrated && m <= MIN_FRACTION_FOR_CONTINUATION * mass0) {
+      disintegrated = true;
+      disintegrationIndex = xs.length - 1;
+      disintegrationTime = t;
+      // We stop generating further dynamics; break out leaving last sample as final.
+      m = 0;
+      break;
+    }
 
     if (steps % REPORT_INTERVAL === 0) {
       const massPct = (m / mass0 * 100).toFixed(2);
@@ -188,10 +239,10 @@ function runSimulation(pIn) {
       const impSpeed = Math.sqrt(impVx*impVx + impWz*impWz);
       const [ilat, ilon] = destinationLatLon(lat0, lon0, bearing, impX);
       const impTime = t + dt_use * frac;
-      xs.push(impX); lats.push(ilat); lons.push(ilon); alts.push(0); vs.push(impSpeed); wzs.push(impWz); times.push(impTime);
+  xs.push(impX); lats.push(ilat); lons.push(ilon); alts.push(0); vs.push(impSpeed); wzs.push(impWz); times.push(impTime); ms.push(m);
       t = impTime; impacted = true; impactTime = impTime; break;
     }
-    x = next.x; z = next.z; vx = next.vx; wz = next.wz; m = Math.max(0.01 * mass0, next.m); t += dt_use; steps++;
+    x = next.x; z = next.z; vx = next.vx; wz = next.wz; m = Math.max(0, next.m); t += dt_use; steps++;
     // Simple rare fragmentation
     const rhoLocal = rhoAtmosphere(Math.max(0,z));
     const dynP = 0.5 * rhoLocal * (vx*vx + wz*wz);
@@ -206,6 +257,7 @@ function runSimulation(pIn) {
   const vsBuf = new Float32Array(vs).buffer;
   const wzsBuf = new Float32Array(wzs).buffer;
   const timesBuf = new Float64Array(times).buffer;
+  const msBuf = new Float64Array(ms).buffer;
 
   // Consequence modeling now uses RESIDUAL kinetic energy at impact (or last sample if no impact).
   // We still compute initial energy for diagnostics and ratio.
@@ -220,10 +272,15 @@ function runSimulation(pIn) {
   const k_eff = 5.7e-5; const Eseis = EkForEffects * k_eff; const mw = (Math.log10(Eseis) - 5.24)/1.44;
 
   return {
-    xs: xsBuf, lats: latsBuf, lons: lonsBuf, alts: altsBuf, vs: vsBuf, wzs: wzsBuf, times: timesBuf,
-    crater_km, mw, tsunami_m,
+    xs: xsBuf, lats: latsBuf, lons: lonsBuf, alts: altsBuf, vs: vsBuf, wzs: wzsBuf, times: timesBuf, ms: msBuf,
+    crater_km: disintegrated ? 0 : crater_km,
+    mw: disintegrated ? 0 : mw,
+    tsunami_m: disintegrated ? 0 : tsunami_m,
     meta: {
       impacted,
+      disintegrated,
+      disintegrationIndex,
+      disintegrationTime,
       steps,
       impactTime,
       lastAlt: alts[n-1],
